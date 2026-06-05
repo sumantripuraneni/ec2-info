@@ -4,14 +4,13 @@ Here is the complete infrastructure documentation formatted as a clean, producti
 
 # `README.md`
 
-```markdown
 # AWS RHEL Image Mode Control Plane Infrastructure
 
 This repository contains the declarative Terraform configurations required to provision a complete, self-contained Red Hat Enterprise Linux 9 engineering environment in AWS (`us-west-2`). This infrastructure acts as the foundational control plane and "OS Factory" used to compile, test, distribute, and monitor **RHEL Image Mode (`bootc`)** appliances.
 
 ## 📐 Architecture & Sizing Topology
 
-The design isolates high-state management engines from stateless utilities, utilizing Red Hat’s official enterprise hardware prerequisites to ensure platform stability under high compilation loads.
+The design isolates high-state management engines from stateless utilities, utilizing Red Hats official enterprise hardware prerequisites to ensure platform stability under high compilation loads.
 
 | Host Name | Target Subnet Tier | Instance Type | Disk Allocation | Operational Purpose |
 | :--- | :--- | :--- | :--- | :--- |
@@ -21,8 +20,6 @@ The design isolates high-state management engines from stateless utilities, util
 | **Quay** | Private Subnet | `m6i.xlarge` | 100 GB GP3 | Red Hat Quay Container Registry used to index and version custom `bootc` image layers. |
 | **Jenkins** | Private Subnet | `c6i.xlarge` | 150 GB GP3 | Compute-optimized CI/CD engine running high-load `bootc-image-builder` pipelines. |
 | **ansible** | Private Subnet | `m6i.xlarge` | 100 GB GP3 | Ansible Automation Platform (AAP) Host handling top-down infrastructure orchestration. |
-
----
 
 ## 🏗️ Core Configuration Files
 
