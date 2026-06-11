@@ -9,6 +9,16 @@ data "aws_ami" "rhel9" {
   }
 }
 
+data "aws_ami" "rhel10" {
+  most_recent = true
+  owners      = ["309956199498"] # Official Red Hat Account ID remains identical
+
+  filter {
+    name   = "name"
+    values = ["RHEL-10.*_HVM-*-x86_64-*"]
+  }
+}
+
 # 1. BASTION (Public Transit Gateway Host)
 resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.rhel9.id
@@ -56,8 +66,8 @@ resource "aws_instance" "satellite" {
 
 # 3. IDENTITY MANAGEMENT (IdM)
 resource "aws_instance" "idm" {
-  ami                    = data.aws_ami.rhel9.id
-  instance_type          = "t3.medium" # 2 vCPU / 4GB RAM Standard
+  ami                    = data.aws_ami.rhel10.id
+  instance_type          = "m6i.xlarge" 
   subnet_id              = module.vpc.private_subnets[1]
   key_name               = aws_key_pair.bastion_key.key_name
   vpc_security_group_ids = [aws_security_group.bastion_sg.id]
@@ -91,7 +101,7 @@ resource "aws_instance" "quay" {
   }
 
   tags = {
-    Name        = "Quay"
+    Name        = "quay"
     Environment = "hack-a-thon"
   }
 }
@@ -112,7 +122,7 @@ resource "aws_instance" "jenkins" {
   }
 
   tags = {
-    Name        = "Jenkins"
+    Name        = "jenkins"
     Environment = "hack-a-thon"
   }
 }
