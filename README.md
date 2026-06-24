@@ -1,11 +1,5 @@
 # ec2-info
 
-Based on my analysis of the repository, here's comprehensive README.md-style information for **https://github.com/sumantripuraneni/ec2-info**:
-
----
-
-# ec2-info
-
 ## Overview
 
 A collection of Ansible playbooks for managing AWS EC2 instance information and VPC infrastructure. This repository provides Infrastructure-as-Code templates for automating EC2 metadata retrieval, instance configuration, and multi-environment VPC provisioning.
