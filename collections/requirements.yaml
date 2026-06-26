@@ -1,2 +1,12 @@
 collections:
+  # Public collections (available on galaxy.ansible.com)
   - name: amazon.aws
+  - name: ansible.posix
+  - name: community.general
+  - name: infra.aap_configuration
+
+  # Red Hat Automation Hub collections (require authentication)
+  # Install these separately after configuring Automation Hub token:
+  #   - name: redhat.satellite
+  #   - name: redhat.satellite_operations
+  #   - name: ansible.controller

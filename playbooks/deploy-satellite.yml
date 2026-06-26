@@ -1,0 +1,211 @@
+---
+- name: Install Red Hat Satellite on AWS EC2 Instance
+  hosts: satellite_servers
+  become: true
+  gather_facts: true
+  vars:
+    satellite_fqdn: "satellite.aws.redhat.local"
+    satellite_short_name: "satellite"
+    aws_dns_resolver: "10.20.0.2"
+    satellite_org: "Default Organization"
+    satellite_location: "AWS us-west-2"
+    satellite_repos:
+      - satellite-6.16-for-rhel-9-x86_64-rpms
+      - satellite-maintenance-6.16-for-rhel-9-x86_64-rpms
+
+  vars_files:
+    - vars-satellite-vault.yml
+
+  tasks:
+    - name: PHASE 0 | Remove AWS RHUI and Enable Subscription Manager Repos
+      block:
+        - name: Remove RHUI client that conflicts with subscription-manager
+          ansible.builtin.dnf:
+            name: rh-amazon-rhui-client*
+            state: absent
+
+        - name: Enable subscription-manager repo management
+          ansible.builtin.lineinfile:
+            path: /etc/rhsm/rhsm.conf
+            regexp: '^manage_repos\s*='
+            line: 'manage_repos = 1'
+            state: present
+
+    - name: PHASE 1 | Register with Red Hat Subscription Manager
+      block:
+        - name: Register system with activation key
+          community.general.redhat_subscription:
+            state: present
+            activationkey: "{{ satellite_activation_key }}"
+            org_id: "{{ satellite_org_id }}"
+            force_register: true
+
+        - name: Disable all default repositories
+          ansible.builtin.command: subscription-manager repos --disable "*"
+          changed_when: true
+
+        - name: Enable required base RHEL repositories
+          ansible.builtin.command: >
+            subscription-manager repos
+            --enable rhel-9-for-x86_64-baseos-rpms
+            --enable rhel-9-for-x86_64-appstream-rpms
+          changed_when: true
+
+        - name: Enable Satellite repositories
+          ansible.builtin.command: >
+            subscription-manager repos
+            --enable {{ item }}
+          loop: "{{ satellite_repos }}"
+          changed_when: true
+
+    - name: PHASE 2 | Hostname and Cloud-Init Network Hardening
+      block:
+        - name: Enforce persistent Satellite FQDN
+          ansible.builtin.hostname:
+            name: "{{ satellite_fqdn }}"
+
+        - name: Ensure cloud-init preserves hostname across reboots
+          ansible.builtin.lineinfile:
+            path: /etc/cloud/cloud.cfg
+            regexp: '^preserve_hostname:'
+            line: 'preserve_hostname: true'
+            state: present
+
+    - name: PHASE 3 | Configure /etc/hosts and DNS Resolution
+      block:
+        - name: Strip myhostname plugin from nsswitch configuration
+          ansible.builtin.lineinfile:
+            path: /etc/nsswitch.conf
+            regexp: '^hosts:\s+files\s+dns\s+myhostname'
+            line: 'hosts:      files dns'
+            state: present
+          register: nsswitch_updated
+
+        - name: Restart NetworkManager to apply changes
+          ansible.builtin.service:
+            name: NetworkManager
+            state: restarted
+          when: nsswitch_updated.changed
+
+        - name: Configure /etc/hosts with Satellite FQDN
+          ansible.builtin.copy:
+            dest: /etc/hosts
+            content: |
+              127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+              ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+              {{ ansible_default_ipv4.address }} {{ satellite_fqdn }} {{ satellite_short_name }}
+            owner: root
+            group: root
+            mode: '0644'
+
+    - name: PHASE 4 | Install Satellite Packages
+      block:
+        - name: Update all existing packages
+          ansible.builtin.dnf:
+            name: '*'
+            state: latest
+
+        - name: Install Red Hat Satellite package
+          ansible.builtin.dnf:
+            name: satellite
+            state: present
+
+    - name: PHASE 5 | Configure Firewall for Satellite Services
+      block:
+        - name: Ensure firewalld is installed
+          ansible.builtin.dnf:
+            name: firewalld
+            state: present
+
+        - name: Start and enable firewalld
+          ansible.builtin.service:
+            name: firewalld
+            state: started
+            enabled: true
+
+        - name: Open required TCP ports for Satellite
+          ansible.posix.firewalld:
+            port: "{{ item }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop:
+            - 80
+            - 443
+            - 5647
+            - 8000
+            - 8140
+            - 9090
+
+        - name: Open DNS UDP port if using embedded DNS
+          ansible.posix.firewalld:
+            port: 53/udp
+            permanent: true
+            state: enabled
+            immediate: true
+
+        - name: Open DNS TCP port if using embedded DNS
+          ansible.posix.firewalld:
+            port: 53/tcp
+            permanent: true
+            state: enabled
+            immediate: true
+
+        - name: Open DHCP port if using Satellite discovery
+          ansible.posix.firewalld:
+            port: 67/udp
+            permanent: true
+            state: enabled
+            immediate: true
+
+        - name: Open TFTP port if using Satellite provisioning
+          ansible.posix.firewalld:
+            port: 69/udp
+            permanent: true
+            state: enabled
+            immediate: true
+
+    - name: PHASE 6 | Execute Satellite Installer
+      ansible.builtin.shell: |
+        satellite-installer \
+          --scenario satellite \
+          --foreman-initial-organization "{{ satellite_org }}" \
+          --foreman-initial-location "{{ satellite_location }}" \
+          --foreman-initial-admin-username admin \
+          --foreman-initial-admin-password "{{ satellite_admin_password }}"
+      args:
+        creates: /var/log/foreman-installer/satellite.log.1
+      register: satellite_installer_output
+      async: 5400
+      poll: 120
+
+    - name: PHASE 7 | Post-Install Validation
+      block:
+        - name: Log installer output (last 20 lines)
+          ansible.builtin.debug:
+            msg: "{{ satellite_installer_output.stdout_lines[-20:] }}"
+          when: satellite_installer_output.changed
+
+        - name: Wait for Satellite services to fully start
+          ansible.builtin.pause:
+            seconds: 60
+
+        - name: Verify Satellite services are running
+          ansible.builtin.command: foreman-maintain service status
+          register: service_status
+          changed_when: false
+          retries: 5
+          delay: 60
+          until: service_status.rc == 0
+
+        - name: Run hammer ping to validate all components
+          ansible.builtin.command: hammer ping
+          register: hammer_ping
+          changed_when: false
+          retries: 3
+          delay: 30
+          until: hammer_ping.rc == 0
+
+        - name: Display Satellite service status
+          ansible.builtin.debug:
+            var: hammer_ping.stdout_lines

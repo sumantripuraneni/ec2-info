@@ -393,7 +393,340 @@ klist
 
 ---
 
-## 🚀 Part 4: Deployment Workflows
+## Part 3b: Satellite & AAP Installation Automation
+
+### Overview
+
+Two playbooks automate the installation of **Red Hat Satellite 6.16** and **Ansible Automation Platform (AAP) 2.4** on their respective EC2 instances provisioned by Terraform.
+
+| Playbook | Target Instance | Purpose |
+|----------|----------------|---------|
+| `playbooks/deploy-satellite.yml` | satellite (m6i.2xlarge, 500GB) | Installs Red Hat Satellite 6.16 |
+| `playbooks/deploy-aap.yml` | ansible (m6i.xlarge, 100GB) | Installs Ansible Automation Platform 2.4 (Controller) |
+
+---
+
+### Step-by-Step Deployment Instructions
+
+#### Prerequisites
+
+Before running the playbooks, ensure you have:
+
+1. **Terraform infrastructure deployed** (`image-mode-hack-a-thon/`)
+2. **Ansible installed** on your local machine
+3. **Ansible collections installed**
+4. **Red Hat account** with Satellite + AAP subscriptions
+5. **Activation keys** created at https://console.redhat.com (with Satellite/AAP repos enabled)
+6. **Red Hat registry credentials** (service account from https://access.redhat.com/terms-based-registry/) — optional, needed only if deploying Automation Hub
+
+---
+
+#### Step 1: Install Ansible and Collections
+
+```bash
+# Install Ansible (if not already installed)
+pip3 install ansible
+
+# Ensure ansible-galaxy is in PATH
+export PATH="/Library/Frameworks/Python.framework/Versions/3.13/bin:$PATH"
+
+# Install required collections
+cd /path/to/ec2-info
+ansible-galaxy collection install -r collections/requirements.yaml --force
+
+# Install Red Hat Automation Hub collections (requires token)
+# Configure ~/.ansible.cfg with Automation Hub token first
+ansible-galaxy collection install redhat.satellite redhat.satellite_operations ansible.controller --force
+```
+
+---
+
+#### Step 2: Provision Infrastructure with Terraform
+
+```bash
+cd image-mode-hack-a-thon
+
+# Set AWS credentials
+export AWS_ACCESS_KEY_ID='your-access-key'
+export AWS_SECRET_ACCESS_KEY='your-secret-key'
+export AWS_DEFAULT_REGION='us-west-2'
+
+# Deploy
+terraform init --upgrade
+terraform validate
+terraform apply -auto-approve
+
+# Capture output IPs
+terraform output public_bastion_ip
+terraform output internal_control_plane_ips
+```
+
+---
+
+#### Step 3: Update Inventory with Terraform Outputs
+
+Edit `playbooks/inventory/hosts` with the IPs from terraform output:
+
+```ini
+[idm_servers]
+<idm_private_ip>
+
+[satellite_servers]
+<satellite_private_ip>
+
+[aap_controllers]
+<aap_private_ip>
+
+[all:vars]
+ansible_user=ec2-user
+ansible_ssh_private_key_file=~/.ssh/aws_bastion_key
+ansible_ssh_common_args=-o StrictHostKeyChecking=accept-new -o ProxyCommand="ssh -i ~/.ssh/aws_bastion_key -o StrictHostKeyChecking=accept-new -W %h:%p ec2-user@<BASTION_PUBLIC_IP>"
+```
+
+---
+
+#### Step 4: Configure Vault Secrets
+
+Edit the vault files with your real credentials, then encrypt:
+
+**Satellite vault** (`playbooks/vars-satellite-vault.yml`):
+```yaml
+satellite_activation_key: "your-activation-key-name"
+satellite_org_id: "your-org-id"
+satellite_admin_password: "your-strong-password"
+```
+
+**AAP vault** (`playbooks/vars-aap-vault.yml`):
+```yaml
+aap_activation_key: "your-activation-key-name"
+aap_org_id: "your-org-id"
+aap_admin_password: "your-strong-password"
+aap_pg_password: "your-db-password"
+registry_username: "your-registry-service-account"
+registry_password: "your-registry-token"
+```
+
+Encrypt both files:
+```bash
+cd playbooks
+ansible-vault encrypt vars-satellite-vault.yml
+ansible-vault encrypt vars-aap-vault.yml
+```
+
+---
+
+#### Step 5: Verify SSH Connectivity
+
+```bash
+cd /path/to/ec2-info
+
+# Test bastion
+ssh -i ~/.ssh/aws_bastion_key ec2-user@<BASTION_PUBLIC_IP>
+
+# Test Ansible connectivity to private hosts
+ansible satellite_servers -i playbooks/inventory/hosts -m ping
+ansible aap_controllers -i playbooks/inventory/hosts -m ping
+```
+
+Expected result: `"ping": "pong"`
+
+---
+
+#### Step 6: Deploy Red Hat Satellite (~45-60 minutes)
+
+```bash
+cd /path/to/ec2-info
+ansible-playbook -i playbooks/inventory/hosts playbooks/deploy-satellite.yml --ask-vault-pass
+```
+
+**What the playbook does (9 phases):**
+
+| Phase | Action | Duration |
+|-------|--------|----------|
+| 0 | Remove AWS RHUI client, enable subscription-manager repos | ~1 min |
+| 1 | Register with Red Hat, enable Satellite repos | ~2 min |
+| 2 | Set hostname `satellite.aws.redhat.local` | ~30 sec |
+| 3 | Configure /etc/hosts and DNS | ~30 sec |
+| 4 | dnf update + install satellite package | ~15 min |
+| 5 | Open firewall ports (80, 443, 5647, 8000, 9090) | ~1 min |
+| 6 | Run satellite-installer | ~30 min |
+| 7 | Validate with hammer ping | ~1 min |
+
+**Success indicator:**
+```
+TASK [Verify Satellite services are running]
+ok: [satellite_ip] => "hammer_ping.stdout_lines": ["candlepin: ok", "foreman: ok", ...]
+```
+
+---
+
+#### Step 7: Deploy Ansible Automation Platform (~30-45 minutes)
+
+No bundle download needed — AAP 2.4 is installed directly from Red Hat subscription repos (RPM method).
+
+```bash
+cd /path/to/ec2-info
+ansible-playbook -i playbooks/inventory/hosts playbooks/deploy-aap.yml --ask-vault-pass
+```
+
+**What the playbook does (10 phases):**
+
+| Phase | Action | Duration |
+|-------|--------|----------|
+| 0 | Remove AWS RHUI client, enable subscription-manager repos | ~1 min |
+| 1 | Register with Red Hat, enable AAP 2.4 repos | ~2 min |
+| 2 | Set hostname `aap.aws.redhat.local` | ~30 sec |
+| 3 | Configure /etc/hosts and DNS | ~30 sec |
+| 4 | Clean up any AAP 2.5 remnants, install AAP 2.4 installer RPM | ~10 min |
+| 5 | Open firewall ports (80, 443, 27199, 5432) | ~1 min |
+| 6 | Install PostgreSQL, create `awx` and `automationhub` DB users | ~2 min |
+| 7 | Template installer inventory and run `setup.sh` | ~20 min |
+| 8 | Run database migrations and restart services | ~2 min |
+| 9 | Validate AAP API health check | ~1 min |
+
+**Success indicator:**
+```
+TASK [Wait for AAP Controller web interface to become available]
+ok: [aap_ip] => "aap_health.json": {"ha": false, "version": "4.5.33", ...}
+```
+
+**Note:** After first deployment, you may need to set the admin password manually:
+```bash
+# SSH to AAP host
+ssh -i ~/.ssh/aws_bastion_key -o ProxyCommand="ssh -i ~/.ssh/aws_bastion_key -W %h:%p ec2-user@<BASTION_IP>" ec2-user@<AAP_PRIVATE_IP>
+sudo awx-manage changepassword admin
+```
+
+---
+
+#### Step 8: Validate and Access Satellite
+
+**Validate Satellite is running (from your Mac):**
+```bash
+# Test HTTPS response through bastion (should return "302")
+ssh -i ~/.ssh/aws_bastion_key \
+    -o ProxyCommand="ssh -i ~/.ssh/aws_bastion_key -o StrictHostKeyChecking=accept-new -W %h:%p ec2-user@<BASTION_PUBLIC_IP>" \
+    ec2-user@<SATELLITE_PRIVATE_IP> \
+    "curl -sk https://localhost:443/ -o /dev/null -w '%{http_code}'"
+```
+
+**Validate from the Satellite instance itself:**
+```bash
+# SSH into Satellite
+ssh -i ~/.ssh/aws_bastion_key \
+    -o ProxyCommand="ssh -i ~/.ssh/aws_bastion_key -o StrictHostKeyChecking=accept-new -W %h:%p ec2-user@<BASTION_PUBLIC_IP>" \
+    ec2-user@<SATELLITE_PRIVATE_IP>
+
+# Check all services are running
+sudo foreman-maintain service status
+
+# Verify all Satellite components respond
+sudo hammer ping
+
+# Expected output:
+#   candlepin:     ok
+#   foreman:       ok
+#   katello/candlepin_events: ok
+#   pulpcore:      ok
+#   ...
+```
+
+**Open Satellite Web UI via SSH tunnel:**
+
+Open a **dedicated terminal** and run (leave it open):
+```bash
+ssh -i ~/.ssh/aws_bastion_key -N -L 8443:<SATELLITE_PRIVATE_IP>:443 ec2-user@<BASTION_PUBLIC_IP>
+```
+
+Then browse to: **https://localhost:8443**
+
+- **Username:** admin
+- **Password:** the password set during `satellite-installer` (from your vault: `satellite_admin_password`)
+- Accept the self-signed certificate warning in your browser (click Advanced > Proceed)
+
+**Note:** You must use `https://` (not `http://`). The `-N` flag keeps the tunnel open without a shell session.
+
+---
+
+#### Step 10: Validate and Access AAP
+
+**Open AAP Web UI via SSH tunnel:**
+
+Open a **separate terminal** and run (leave it open):
+```bash
+ssh -i ~/.ssh/aws_bastion_key -N -L 8444:<AAP_PRIVATE_IP>:443 ec2-user@<BASTION_PUBLIC_IP>
+```
+
+Then browse to: **https://localhost:8444**
+
+- **Username:** admin
+- **Password:** the password set during AAP setup (from your vault: `aap_admin_password`)
+
+**Validate AAP API health:**
+```bash
+curl -sk https://localhost:8444/api/v2/ping/
+# Expected: {"ha":false,"version":"4.x.x","active_node":"aap.aws.redhat.local",...}
+```
+
+---
+
+### Tunnel Quick Reference
+
+| Service | SSH Tunnel Command | Browser URL | Credentials |
+|---------|-------------------|-------------|-------------|
+| Satellite | `ssh -i ~/.ssh/aws_bastion_key -N -L 8443:<SAT_IP>:443 ec2-user@<BASTION_IP>` | https://localhost:8443 | admin / satellite_admin_password |
+| AAP | `ssh -i ~/.ssh/aws_bastion_key -N -L 8444:<AAP_IP>:443 ec2-user@<BASTION_IP>` | https://localhost:8444 | admin / aap_admin_password |
+
+To close a tunnel, press `Ctrl+C` in the terminal running the SSH command.
+
+If a tunnel won't start (port in use), check with: `lsof -i :8443` or `lsof -i :8444`
+
+---
+
+### Important Notes
+
+- **Install order matters:** Satellite first, then AAP. Satellite can serve as the content source for AAP.
+- **AWS RHUI conflict:** The playbooks automatically remove the `rh-amazon-rhui-client` package and set `manage_repos = 1` in `/etc/rhsm/rhsm.conf`. This is required because AWS RHEL AMIs disable subscription-manager repo management by default.
+- **AAP version:** Uses AAP 2.4 (not 2.5). AAP 2.5 requires separate VMs for Controller, Hub, and Gateway. AAP 2.4 supports single-node (Controller-only) deployment.
+- **Activation keys:** Must have the correct repos enabled in the Red Hat Console (Satellite 6.16 for RHEL 9, AAP 2.4 for RHEL 9).
+- **Registry credentials:** Only needed if you enable Automation Hub (`[automationhub]` in the inventory template). Controller-only installs don't require them.
+- **PostgreSQL:** The playbook explicitly creates PostgreSQL users and databases before running `setup.sh`, ensuring reliable installs regardless of prior state.
+
+---
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `ansible ping` fails with timeout | Wrong bastion IP in inventory | Run `terraform output public_bastion_ip` and update inventory |
+| `subscription-manager repos --list` shows nothing | `manage_repos = 0` in rhsm.conf | `sudo sed -i 's/manage_repos = 0/manage_repos = 1/' /etc/rhsm/rhsm.conf` |
+| `No match for argument: satellite` | Satellite repo not enabled or not in subscription | Verify activation key has Satellite repos at console.redhat.com |
+| `Repositories disabled by configuration` | RHUI client still installed | `sudo dnf remove -y rh-amazon-rhui-client*` |
+| SSH "Permission denied" through bastion | Key not forwarded | Use ProxyCommand method (already in inventory) or `ssh -A` for agent forwarding |
+| satellite-installer times out | Takes >60 min on slow network | SSH to instance, check: `tail -f /var/log/foreman-installer/satellite.log` |
+| AAP setup.sh fails with `password authentication failed for user "awx"` | PostgreSQL user not created or pg_hba.conf uses `peer` auth | Re-run playbook — Phase 6 handles this automatically |
+| AAP API returns HTTP 500 after install | Database migrations not run | SSH to host, run: `sudo awx-manage migrate && sudo systemctl restart automation-controller` |
+| AAP login shows "problem logging in" | Admin password not set during install | SSH to host, run: `sudo awx-manage changepassword admin` |
+| AAP image push fails (registry.redhat.io) | Missing or invalid registry credentials | Add `registry_username`/`registry_password` to vault (only needed with Hub enabled) |
+| DNF dependency conflicts during AAP install | AAP 2.5 packages still present | Phase 4 handles cleanup automatically; if persists: `sudo dnf remove -y 'automation-*'` |
+
+---
+
+### File Reference (Satellite & AAP)
+
+| File | Purpose |
+|------|---------|
+| `playbooks/deploy-satellite.yml` | Satellite 6.16 installation playbook |
+| `playbooks/deploy-aap.yml` | AAP 2.4 Controller installation playbook (RPM method) |
+| `playbooks/templates/aap-inventory.j2` | Jinja2 template for AAP installer inventory |
+| `playbooks/vars-satellite-vault.yml` | Satellite credentials (encrypt before use) |
+| `playbooks/vars-aap-vault.yml` | AAP credentials (encrypt before use) |
+| `playbooks/inventory/hosts` | Ansible inventory with SSH proxy config |
+| `collections/requirements.yaml` | Required Ansible collections |
+
+---
+
+## Part 4: Deployment Workflows
 
 ### 4.1 Option A: Terraform Deployment (Image Mode Control Plane)
 
