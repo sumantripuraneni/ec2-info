@@ -1,0 +1,277 @@
+---
+- name: Install Ansible Automation Platform (AAP) on AWS EC2 Instance
+  hosts: aap_controllers
+  become: true
+  gather_facts: true
+  vars:
+    aap_fqdn: "aap.aws.redhat.local"
+    aap_short_name: "aap"
+    aws_dns_resolver: "10.20.0.2"
+    aap_installer_dir: "/opt/ansible-automation-platform/installer"
+    aap_repos:
+      - ansible-automation-platform-2.4-for-rhel-9-x86_64-rpms
+
+  vars_files:
+    - vars-aap-vault.yml
+
+  tasks:
+    - name: PHASE 0 | Remove AWS RHUI and Enable Subscription Manager Repos
+      block:
+        - name: Remove RHUI client that conflicts with subscription-manager
+          ansible.builtin.dnf:
+            name: rh-amazon-rhui-client*
+            state: absent
+
+        - name: Enable subscription-manager repo management
+          ansible.builtin.lineinfile:
+            path: /etc/rhsm/rhsm.conf
+            regexp: '^manage_repos\s*='
+            line: 'manage_repos = 1'
+            state: present
+
+    - name: PHASE 1 | Register with Red Hat Subscription Manager
+      block:
+        - name: Register system with activation key
+          community.general.redhat_subscription:
+            state: present
+            activationkey: "{{ aap_activation_key }}"
+            org_id: "{{ aap_org_id }}"
+            force_register: true
+
+        - name: Disable all default repositories
+          ansible.builtin.command: subscription-manager repos --disable "*"
+          changed_when: true
+
+        - name: Enable required base RHEL repositories
+          ansible.builtin.command: >
+            subscription-manager repos
+            --enable rhel-9-for-x86_64-baseos-rpms
+            --enable rhel-9-for-x86_64-appstream-rpms
+          changed_when: true
+
+        - name: Enable AAP repositories
+          ansible.builtin.command: >
+            subscription-manager repos
+            --enable {{ item }}
+          loop: "{{ aap_repos }}"
+          changed_when: true
+
+    - name: PHASE 2 | Hostname and Cloud-Init Network Hardening
+      block:
+        - name: Enforce persistent AAP FQDN
+          ansible.builtin.hostname:
+            name: "{{ aap_fqdn }}"
+
+        - name: Ensure cloud-init preserves hostname across reboots
+          ansible.builtin.lineinfile:
+            path: /etc/cloud/cloud.cfg
+            regexp: '^preserve_hostname:'
+            line: 'preserve_hostname: true'
+            state: present
+
+    - name: PHASE 3 | Configure /etc/hosts and DNS Resolution
+      block:
+        - name: Strip myhostname plugin from nsswitch configuration
+          ansible.builtin.lineinfile:
+            path: /etc/nsswitch.conf
+            regexp: '^hosts:\s+files\s+dns\s+myhostname'
+            line: 'hosts:      files dns'
+            state: present
+          register: nsswitch_updated
+
+        - name: Restart NetworkManager to apply changes
+          ansible.builtin.service:
+            name: NetworkManager
+            state: restarted
+          when: nsswitch_updated.changed
+
+        - name: Configure /etc/hosts with AAP FQDN
+          ansible.builtin.copy:
+            dest: /etc/hosts
+            content: |
+              127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+              ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+              {{ ansible_default_ipv4.address }} {{ aap_fqdn }} {{ aap_short_name }}
+            owner: root
+            group: root
+            mode: '0644'
+
+    - name: PHASE 4 | Install AAP 2.4 Installer Package
+      block:
+        - name: Enable AAP 2.4 repo
+          ansible.builtin.command: >
+            subscription-manager repos
+            --enable ansible-automation-platform-2.4-for-rhel-9-x86_64-rpms
+          changed_when: true
+
+        - name: Install the AAP 2.4 installer package
+          ansible.builtin.dnf:
+            name:
+              - ansible-automation-platform-installer
+              - ansible-core
+            state: present
+
+    - name: PHASE 5 | Configure Firewall for AAP Services
+      block:
+        - name: Ensure firewalld is installed
+          ansible.builtin.dnf:
+            name: firewalld
+            state: present
+
+        - name: Start and enable firewalld
+          ansible.builtin.service:
+            name: firewalld
+            state: started
+            enabled: true
+
+        - name: Open required TCP ports for AAP Controller
+          ansible.posix.firewalld:
+            port: "{{ item }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop:
+            - 80
+            - 443
+            - 27199
+            - 5432
+
+    - name: PHASE 6 | PostgreSQL Database and User Setup
+      block:
+        - name: Install PostgreSQL server
+          ansible.builtin.dnf:
+            name: postgresql-server
+            state: present
+
+        - name: Check if PostgreSQL data directory is initialized
+          ansible.builtin.stat:
+            path: /var/lib/pgsql/data/PG_VERSION
+          register: pg_data_dir
+
+        - name: Initialize PostgreSQL database
+          ansible.builtin.command: postgresql-setup --initdb
+          when: not pg_data_dir.stat.exists
+
+        - name: Configure pg_hba.conf for password authentication
+          ansible.builtin.copy:
+            dest: /var/lib/pgsql/data/pg_hba.conf
+            content: |
+              # TYPE  DATABASE        USER            ADDRESS                 METHOD
+              local   all             postgres                                peer
+              local   all             all                                     md5
+              host    all             all             127.0.0.1/32            md5
+              host    all             all             ::1/128                 md5
+            owner: postgres
+            group: postgres
+            mode: '0600'
+          register: pg_hba_changed
+
+        - name: Start and enable PostgreSQL
+          ansible.builtin.service:
+            name: postgresql
+            state: started
+            enabled: true
+
+        - name: Restart PostgreSQL if pg_hba.conf changed
+          ansible.builtin.service:
+            name: postgresql
+            state: restarted
+          when: pg_hba_changed.changed
+
+        - name: Create awx PostgreSQL user
+          ansible.builtin.shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='awx'" | grep -q 1 \
+              && sudo -u postgres psql -c "ALTER USER awx WITH PASSWORD '{{ aap_pg_password }}';" \
+              || sudo -u postgres psql -c "CREATE USER awx WITH PASSWORD '{{ aap_pg_password }}' CREATEDB;"
+          changed_when: true
+          no_log: true
+
+        - name: Create awx database
+          ansible.builtin.shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='awx'" | grep -q 1 \
+              || sudo -u postgres psql -c "CREATE DATABASE awx OWNER awx;"
+          changed_when: true
+
+        - name: Create automationhub PostgreSQL user
+          ansible.builtin.shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='automationhub'" | grep -q 1 \
+              && sudo -u postgres psql -c "ALTER USER automationhub WITH PASSWORD '{{ aap_pg_password }}';" \
+              || sudo -u postgres psql -c "CREATE USER automationhub WITH PASSWORD '{{ aap_pg_password }}' CREATEDB;"
+          changed_when: true
+          no_log: true
+
+        - name: Create automationhub database
+          ansible.builtin.shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='automationhub'" | grep -q 1 \
+              || sudo -u postgres psql -c "CREATE DATABASE automationhub OWNER automationhub;"
+          changed_when: true
+
+        - name: Verify awx user can authenticate
+          ansible.builtin.shell: |
+            PGPASSWORD='{{ aap_pg_password }}' psql -U awx -h localhost -d awx -c "SELECT 1;" >/dev/null 2>&1
+          changed_when: false
+          no_log: true
+
+    - name: PHASE 7 | Configure AAP Installer Inventory and Run Setup
+      block:
+        - name: Template the AAP installer inventory
+          ansible.builtin.template:
+            src: templates/aap-inventory.j2
+            dest: "{{ aap_installer_dir }}/inventory"
+            mode: '0644'
+
+        - name: Run AAP setup.sh installer
+          ansible.builtin.shell: |
+            cd {{ aap_installer_dir }} && ./setup.sh
+          register: aap_installer_output
+          async: 5400
+          poll: 120
+
+    - name: PHASE 8 | Post-Install — Run Migrations and Start Services
+      block:
+        - name: Run database migrations
+          ansible.builtin.command: awx-manage migrate --noinput
+          register: migration_result
+          changed_when: "'No migrations to apply' not in migration_result.stdout"
+
+        - name: Restart automation-controller service
+          ansible.builtin.service:
+            name: automation-controller
+            state: restarted
+
+        - name: Wait for AAP services to fully start
+          ansible.builtin.pause:
+            seconds: 30
+
+    - name: PHASE 9 | Post-Install Validation
+      block:
+        - name: Check if automation-controller service is running
+          ansible.builtin.service_facts:
+
+        - name: Verify automation-controller is active
+          ansible.builtin.assert:
+            that:
+              - "'automation-controller.service' in ansible_facts.services"
+            fail_msg: "automation-controller service not found — installer may not have completed"
+
+        - name: Wait for AAP Controller web interface to become available
+          ansible.builtin.uri:
+            url: "https://{{ aap_fqdn }}/api/v2/ping/"
+            validate_certs: false
+            status_code: 200
+          register: aap_health
+          retries: 10
+          delay: 30
+          until: aap_health.status == 200
+
+        - name: Display AAP health check response
+          ansible.builtin.debug:
+            var: aap_health.json
+
+        - name: Display AAP access information
+          ansible.builtin.debug:
+            msg:
+              - "AAP Controller is available at: https://{{ aap_fqdn }}"
+              - "Username: admin"
+              - "Access via SSH tunnel: ssh -i ~/.ssh/aws_bastion_key -N -L 8444:{{ ansible_default_ipv4.address }}:443 ec2-user@<BASTION_IP>"
+              - "Then browse: https://localhost:8444"
